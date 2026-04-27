@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# macOS
+.DS_Store
+
+# Dados de saída (gerados pelo script, não são código)
+*.xlsx
+
+# Credenciais — NUNCA commitar
+.streamlit/secrets.toml
+.env
+*.env
+
+# IDEs
+.vscode/
+.idea/
