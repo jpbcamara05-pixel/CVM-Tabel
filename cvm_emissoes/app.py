@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Importações locais
 from scraper.api_client import CVMApiError, listar_status, listar_valores_mobiliarios
 from scraper.collector import ResultadoColeta, coletar
-from exporter.excel import exportar_excel, COLUNAS_EMISSOES
+from exporter.excel import exportar_excel, COLUNAS_EMISSOES, COLUNAS_FEES
 
 # ---------------------------------------------------------------------------
 # Configuração Gemini
@@ -146,7 +146,7 @@ def _gerar_chunks(data_inicio: date, data_fim: date, dias_por_chunk: int = 90) -
 
 def _build_df_preview(registros: list[dict]) -> pd.DataFrame:
     df = pd.DataFrame(registros)
-    df = df.drop(columns=["_id_requerimento"], errors="ignore")
+    df = df.drop(columns=["_id_requerimento", "_texto_busca_cnpj"], errors="ignore")
     rename_map = {k: v for k, v in COLUNAS_EMISSOES.items() if k in df.columns}
     return df.rename(columns=rename_map)
 
@@ -198,6 +198,22 @@ with st.sidebar:
 
     st.divider()
 
+    # Tipo de uso
+    st.subheader("Tipo de Uso")
+    tipo_uso = st.radio(
+        "Destinação da base",
+        options=["Uso Externo (Clientes)", "Uso Interno"],
+        index=0,
+        help=(
+            "**Uso Interno**: inclui colunas de fees (Fee Flat, Fee Canal, Fee de Sucesso) "
+            "extraídas do Prospecto Definitivo para ofertas com público Qualificado ou Geral.\n\n"
+            "**Uso Externo**: base sem colunas de fees."
+        ),
+    )
+    uso_interno = tipo_uso == "Uso Interno"
+
+    st.divider()
+
     # Botão de consulta
     btn_consultar = st.button(
         "🔎 Consultar",
@@ -218,7 +234,7 @@ with st.sidebar:
 # Estado da sessão
 # ---------------------------------------------------------------------------
 
-for _key in ("resultado", "df_preview", "erros_chunks", "chunks_total", "filtros_usados"):
+for _key in ("resultado", "df_preview", "erros_chunks", "chunks_total", "filtros_usados", "uso_interno"):
     if _key not in st.session_state:
         st.session_state[_key] = None
 
@@ -239,6 +255,7 @@ if btn_consultar:
         # Limpa estado anterior
         for _k in ("resultado", "df_preview", "erros_chunks", "chunks_total"):
             st.session_state[_k] = None
+        st.session_state["uso_interno"] = uso_interno
         st.session_state["filtros_usados"] = {
             "data_inicio": data_inicio_fmt,
             "data_fim": data_fim_fmt,
@@ -290,6 +307,7 @@ if btn_consultar:
                         valor_mobiliario_nome=vm_filtro,
                         status=status_filtro,
                         progresso_callback=_progresso,
+                        buscar_fees=uso_interno,
                     )
                     # Merge no consolidado
                     resultado_consolidado.registros.extend(resultado_chunk.registros)
@@ -339,6 +357,7 @@ df_preview = st.session_state.get("df_preview")
 erros_chunks = st.session_state.get("erros_chunks")
 chunks_total = st.session_state.get("chunks_total") or 1
 filtros_usados = st.session_state.get("filtros_usados") or {}
+_uso_interno_resultado = st.session_state.get("uso_interno") or False
 
 has_data = resultado is not None and bool(resultado.registros)
 query_done = resultado is not None or erros_chunks is not None
@@ -461,6 +480,12 @@ elif has_data and df_preview is not None:
         st.write("")
         btn_exportar = st.button("⬇️ Gerar Excel", use_container_width=True, type="primary")
 
+    if _uso_interno_resultado:
+        st.caption(
+            "**Uso Interno** — colunas de fees incluídas para ofertas com "
+            "público Qualificado ou Geral (fonte: Prospecto Definitivo)."
+        )
+
     if btn_exportar:
         with st.spinner("Gerando arquivo Excel..."):
             try:
@@ -470,6 +495,7 @@ elif has_data and df_preview is not None:
                     registros=resultado.registros,
                     erros=resultado.erros,
                     output_path=tmp_path,
+                    incluir_fees=_uso_interno_resultado,
                 )
                 with open(tmp_path, "rb") as f:
                     dados_excel = f.read()

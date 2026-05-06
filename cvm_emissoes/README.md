@@ -9,6 +9,7 @@ com exportação para Excel.
 
 - Python 3.11 ou superior
 - Conexão com internet (acesso ao portal da CVM)
+- Chave de API do Google AI (`GOOGLE_API_KEY`) para o assistente de análise (Gemini)
 
 ---
 
@@ -26,6 +27,28 @@ source .venv/bin/activate      # Mac/Linux
 # Instalar dependências
 pip install -r requirements.txt
 ```
+
+---
+
+## Configuração da chave do Google AI (Gemini)
+
+O assistente de análise usa a API Gemini. Configure a chave de uma das formas abaixo:
+
+**Opção 1 — variável de ambiente (recomendado para produção):**
+```bash
+export GOOGLE_API_KEY="sua_chave_aqui"
+```
+
+**Opção 2 — arquivo local (apenas para desenvolvimento, nunca versionar):**
+
+Crie o arquivo `cvm_emissoes/.streamlit/secrets.toml` com o conteúdo:
+```toml
+GOOGLE_API_KEY = "sua_chave_aqui"
+```
+
+> ⚠️ **Nunca commite `secrets.toml` ou qualquer arquivo com chaves de API.**
+> Esse arquivo já está listado no `.gitignore`. Obtenha sua chave em
+> [aistudio.google.com/apikey](https://aistudio.google.com/apikey).
 
 ---
 
@@ -53,15 +76,21 @@ A interface abrirá automaticamente no navegador em `http://localhost:8501`.
 
 ```
 cvm_emissoes/
-├── app.py                  # Interface Streamlit
+├── app.py                          # Interface Streamlit
 ├── requirements.txt
+├── .streamlit/
+│   └── secrets.toml                # ⚠️ NÃO versionar — chaves locais
 ├── scraper/
-│   ├── api_client.py       # Cliente HTTP para a API REST da CVM
-│   ├── collector.py        # Orquestração: listagem + detalhamento
-│   └── extractor.py        # Transformação: dados brutos → registros por série
+│   ├── api_client.py               # Cliente HTTP para a API REST da CVM
+│   ├── collector.py                # Orquestração: listagem + detalhamento
+│   ├── extractor.py                # Transformação: dados brutos → registros por série
+│   ├── fees_extractor.py           # Extração de fees do Prospecto Definitivo (PDF)
+│   └── sector_classifier.py       # Classificação de setor via CNPJ + BrasilAPI
 └── exporter/
-    └── excel.py            # Geração do arquivo Excel
+    └── excel.py                    # Geração do arquivo Excel (.xlsx)
 ```
+
+> Arquivos `.xlsx` são outputs gerados pela aplicação e não fazem parte do repositório.
 
 ---
 

@@ -174,6 +174,14 @@ def extrair_registros(
     inf_dict = _inf_oferta_dict(inf_oferta)
     partic_dict = _participantes_por_tipo(participantes)
 
+    # Texto bruto para extração de CNPJ pelo sector_classifier.
+    # Prioriza o campo de devedores (contém CNPJ explícito para securitizados)
+    # e inclui o nome do emissor como fallback para debêntures.
+    _texto_busca_cnpj = " ".join(filter(None, [
+        inf_dict.get("Identificação dos devedores e coobrigados", ""),
+        nome_emissor,
+    ]))
+
     # ------------------------------------------------------------------
     # Campos de nível emissão
     # ------------------------------------------------------------------
@@ -193,9 +201,13 @@ def extrair_registros(
     volume_inicial = info_gerais.get("valorTotalInicial") or info_gerais.get("valorTotal")
     volume_final = info_gerais.get("valorTotalFinal") or info_gerais.get("valorTotal")
 
-    # Público alvo — normalizado para as 3 categorias padrão
-    publico_alvo_raw = inf_dict.get("Público alvo") or inf_dict.get("Público-alvo") or ""
-    publico_alvo = _normalizar_publico_alvo(publico_alvo_raw)
+    # Público alvo — busca case-insensitive para cobrir variações da API
+    # (ex: "Público alvo", "Público-alvo", "Público Alvo", "publico alvo")
+    _publico_chave = next(
+        (v for k, v in inf_dict.items() if "p" in k.lower() and "blico" in k.lower() and "lvo" in k.lower()),
+        ""
+    )
+    publico_alvo = _normalizar_publico_alvo(_publico_chave)
 
     # Regime de distribuição (firme / melhores esforços)
     regime_distribuicao = inf_dict.get("Regime de distribuição") or ""
@@ -253,6 +265,7 @@ def extrair_registros(
                 coordenadores=coordenadores,
                 link_cvm=link_cvm,
                 id_req=id_req,
+                texto_busca_cnpj=_texto_busca_cnpj,
             )
             registros.append(registro)
 
@@ -276,6 +289,7 @@ def extrair_registros(
             link_cvm=link_cvm,
             id_req=id_req,
             numero_registro=item_listagem.get("numeroRegistro", ""),
+            texto_busca_cnpj=_texto_busca_cnpj,
         ))
 
     return registros
@@ -397,8 +411,9 @@ def _extrair_serie(serie: dict, **emissao_fields) -> dict:
         "book_consorcio": emissao_fields["book_consorcio"],
         "coordenadores": emissao_fields["coordenadores"],
         "link_cvm": emissao_fields["link_cvm"],
-        # Metadados para debug
+        # Metadados internos (removidos na exibição/exportação)
         "_id_requerimento": emissao_fields["id_req"],
+        "_texto_busca_cnpj": emissao_fields.get("texto_busca_cnpj", ""),
     }
 
 
@@ -436,6 +451,7 @@ def _registro_sem_serie(**fields) -> dict:
         "coordenadores": fields["coordenadores"],
         "link_cvm": fields["link_cvm"],
         "_id_requerimento": fields["id_req"],
+        "_texto_busca_cnpj": fields.get("texto_busca_cnpj", ""),
     }
 
 

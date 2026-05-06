@@ -5,6 +5,7 @@ Separa logs de erro em uma lista à parte para rastreabilidade.
 """
 
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,8 +24,24 @@ from .api_client import (
     pesquisar_todas_paginas,
 )
 from .extractor import extrair_dados_anuncio_encerramento, extrair_registros
+from .sector_classifier import classificar_setor
+from .fees_extractor import (
+    documento_e_prospecto_definitivo,
+    extrair_fees_prospecto,
+    publico_elegivel_para_fees,
+)
 
 logger = logging.getLogger(__name__)
+
+# Limita downloads de PDF simultâneos para não sobrecarregar o servidor da CVM.
+# Workers que fazem apenas chamadas de API não são afetados.
+_pdf_semaphore = threading.Semaphore(3)
+
+# Cache de PDFs já baixados na coleta atual (chave: UUID do documento).
+# Evita baixar o mesmo arquivo mais de uma vez quando múltiplas séries referenciam
+# o mesmo documento. Limpo no início de cada chamada a coletar().
+_pdf_cache: dict[str, bytes] = {}
+_pdf_cache_lock = threading.Lock()
 
 # Se este número de emissões consecutivas falhar em todos os detalhes,
 # assume que a API está com problema geral e emite aviso destacado.
@@ -35,9 +52,10 @@ LIMITE_FALHAS_CONSECUTIVAS = 10
 # A filtragem final também usa data_requerimento, então não há necessidade de expandir.
 ANOS_PRE_FILTRO = 0
 
-# Workers paralelos para busca de detalhes (cada worker tem sua própria sessão HTTP)
-# Cada worker abre 4 sub-threads internamente — total máximo: MAX_WORKERS × 4 conexões
-MAX_WORKERS = 6
+# Workers paralelos para busca de detalhes + enrichment de PDF.
+# Cada worker abre até 5 sub-threads internamente — total máximo: MAX_WORKERS × 5 conexões.
+# Aumentado para 10 porque a maior parte do tempo é I/O (API + PDF downloads).
+MAX_WORKERS = 10
 
 
 @dataclass
@@ -57,6 +75,7 @@ def coletar(
     valor_mobiliario_nome: Optional[str] = None,
     status: Optional[str] = None,
     progresso_callback: Optional[Callable] = None,
+    buscar_fees: bool = False,
 ) -> ResultadoColeta:
     """
     Executa a coleta completa:
@@ -75,6 +94,10 @@ def coletar(
         ResultadoColeta com os registros e log de erros
     """
     resultado = ResultadoColeta()
+
+    global _pdf_cache
+    with _pdf_cache_lock:
+        _pdf_cache.clear()
 
     def _cb(etapa, atual, total, msg=""):
         if progresso_callback:
@@ -136,9 +159,9 @@ def coletar(
     concluidos = 0
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        # Submete todas as emissões para busca paralela de detalhes
+        # Submete busca + enrichment completo para cada emissão em paralelo
         future_to_item = {
-            executor.submit(_buscar_detalhes_emissao, item): item
+            executor.submit(_processar_emissao, item, buscar_fees): item
             for item in emissoes
         }
 
@@ -152,11 +175,11 @@ def coletar(
                 f"Detalhando {concluidos}/{len(emissoes)}: {numero_processo}")
 
             try:
-                requerimento, inf_oferta, participantes, historico, documentos, erros_emissao = future.result()
+                registros_serie, erros_emissao = future.result()
             except Exception as e:
-                logger.error("Erro inesperado ao buscar detalhes [%s]: %s", id_req, e, exc_info=True)
+                logger.error("Erro inesperado ao processar [%s]: %s", id_req, e, exc_info=True)
+                registros_serie = []
                 erros_emissao = [{"campo": "busca_detalhes", "erro": str(e)}]
-                requerimento, inf_oferta, participantes, historico, documentos = None, [], [], [], []
 
             # Detectar sequência de falhas (sinal de instabilidade geral da API)
             if _todos_falharam(erros_emissao):
@@ -176,21 +199,8 @@ def coletar(
             else:
                 falhas_consecutivas = 0
 
-            # Extrair registros por série (sempre tenta, mesmo com dados parciais)
-            try:
-                registros_serie = extrair_registros(
-                    item_listagem=item,
-                    requerimento=requerimento,
-                    inf_oferta=inf_oferta,
-                    participantes=participantes,
-                    historico=historico,
-                )
-                _enriquecer_com_pdf(registros_serie, documentos)
-                resultado.registros.extend(registros_serie)
-                resultado.total_series += len(registros_serie)
-            except Exception as e:
-                logger.error("Erro ao extrair dados [%s]: %s", id_req, e, exc_info=True)
-                erros_emissao.append({"campo": "extração", "erro": str(e)})
+            resultado.registros.extend(registros_serie)
+            resultado.total_series += len(registros_serie)
 
             # Registrar erros desta emissão
             if erros_emissao:
@@ -276,6 +286,154 @@ def _todos_falharam(erros: list[dict]) -> bool:
     return campos_criticos.issubset(campos_com_erro)
 
 
+def _enriquecer_com_prospecto(registros: list[dict], documentos: list[dict]) -> None:
+    """
+    Extrai fees do Prospecto Definitivo para registros com público-alvo elegível.
+
+    Só busca e baixa o PDF quando há pelo menos um registro com público-alvo
+    Qualificado ou Geral. Deixa os campos em None se não encontrar claramente.
+    Modifica a lista de registros in-place.
+    """
+    if not registros or not documentos:
+        return
+
+    # Inicializa chaves de fee em todos os registros (None = não encontrado)
+    for reg in registros:
+        reg.setdefault("fee_flat", None)
+        reg.setdefault("fee_canal_distribuicao", None)
+        reg.setdefault("fee_canal_flat", None)
+        reg.setdefault("fee_sucesso", None)
+
+    # Verifica se algum registro é elegível
+    elegiveis = [r for r in registros if publico_elegivel_para_fees(r.get("publico_alvo"))]
+    if not elegiveis:
+        return
+
+    doc_prospecto = next(
+        (d for d in documentos if documento_e_prospecto_definitivo(d.get("nome", ""))),
+        None,
+    )
+    if not doc_prospecto:
+        return
+
+    try:
+        pdf_bytes = _baixar_pdf_cached(doc_prospecto["valor"])
+    except Exception as e:
+        logger.warning("Falha ao baixar Prospecto Definitivo: %s", e)
+        return
+
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            # Prefixos em vez de palavras completas para cobrir singular e plural:
+            # comiss* → comissão, comissões, comissionamento
+            # remuner* → remuneração, remunerando
+            # fee cobre "fee flat", "fee de sucesso", "fee canal"
+            _PREFIXOS_FEES = ("comiss", "remuner", "fee")
+            paginas_relevantes = []
+            for p in pdf.pages:
+                txt = p.extract_text() or ""
+                if any(pref in txt.lower() for pref in _PREFIXOS_FEES):
+                    paginas_relevantes.append(txt)
+            texto = "\n".join(paginas_relevantes)
+    except Exception as e:
+        logger.warning("Falha ao extrair texto do Prospecto Definitivo: %s", e)
+        return
+
+    fees = extrair_fees_prospecto(texto)
+
+    for reg in elegiveis:
+        reg["fee_flat"] = fees["fee_flat"]
+        reg["fee_canal_distribuicao"] = fees["fee_canal_distribuicao"]
+        reg["fee_canal_flat"] = fees["fee_canal_flat"]
+        reg["fee_sucesso"] = fees["fee_sucesso"]
+
+
+def _baixar_pdf_cached(valor: str) -> bytes:
+    """
+    Baixa um PDF com semáforo (máx. 3 simultâneos) e cache por UUID.
+    Se o mesmo documento for solicitado por múltiplos workers, apenas um baixa
+    e os demais recebem o resultado do cache.
+    """
+    uuid = valor.split(",")[0].strip()
+
+    with _pdf_cache_lock:
+        if uuid in _pdf_cache:
+            return _pdf_cache[uuid]
+
+    with _pdf_semaphore:
+        with _pdf_cache_lock:
+            if uuid in _pdf_cache:
+                return _pdf_cache[uuid]
+
+        pdf_bytes = baixar_pdf_documento(valor)
+
+        with _pdf_cache_lock:
+            _pdf_cache[uuid] = pdf_bytes
+
+        return pdf_bytes
+
+
+def _enriquecer_com_setor(registros: list[dict]) -> None:
+    """
+    Classifica o setor econômico de cada registro usando duas estratégias:
+
+    1. Pré-classificação por instrumento (instantânea, sem API):
+       CRA → "Agronegócio"  |  CRI → "Imobiliário"
+
+    2. Lookup por CNPJ via BrasilAPI para os demais instrumentos.
+       Extrai o CNPJ do texto bruto da emissão (campo de devedores / nome emissor)
+       e consulta o CNAE principal da empresa.
+
+    Modifica a lista de registros in-place. Setor fica None quando não identificado.
+    """
+    for reg in registros:
+        if reg.get("setor") is not None:
+            continue
+
+        nome_vm = (reg.get("valor_mobiliario") or "").lower()
+
+        # Classificação estrutural por instrumento (não requer API)
+        if "agroneg" in nome_vm:
+            reg["setor"] = "Agronegócio"
+            continue
+        if "imobiliár" in nome_vm or "imobiliar" in nome_vm:
+            reg["setor"] = "Real Estate"
+            continue
+
+        # Classificação por CNPJ via BrasilAPI
+        texto_cnpj = reg.get("_texto_busca_cnpj") or ""
+        if texto_cnpj:
+            reg["setor"] = classificar_setor([texto_cnpj])
+
+
+def _processar_emissao(item: dict, buscar_fees: bool) -> tuple[list[dict], list[dict]]:
+    """
+    Executa busca de detalhes via API + enrichment de PDFs em um único worker thread.
+    Mover o enrichment para cá (em vez do loop principal) permite que múltiplas
+    emissões façam downloads de PDF em paralelo.
+    """
+    requerimento, inf_oferta, participantes, historico, documentos, erros = _buscar_detalhes_emissao(item)
+    registros: list[dict] = []
+    try:
+        registros = extrair_registros(
+            item_listagem=item,
+            requerimento=requerimento,
+            inf_oferta=inf_oferta,
+            participantes=participantes,
+            historico=historico,
+        )
+        _enriquecer_com_setor(registros)
+        _enriquecer_com_pdf(registros, documentos)
+        if buscar_fees:
+            _enriquecer_com_prospecto(registros, documentos)
+    except Exception as e:
+        id_req = item.get("idRequerimento", "")
+        logger.error("Erro ao extrair dados [%s]: %s", id_req, e, exc_info=True)
+        erros.append({"campo": "extração", "erro": str(e)})
+    return registros, erros
+
+
 def _buscar_detalhes_emissao(
     item: dict,
 ) -> tuple[Optional[dict], list, list, list, list, list]:
@@ -350,7 +508,7 @@ def _enriquecer_com_pdf(registros: list[dict], documentos: list[dict]) -> None:
         return
 
     try:
-        pdf_bytes = baixar_pdf_documento(doc_enc["valor"])
+        pdf_bytes = _baixar_pdf_cached(doc_enc["valor"])
     except Exception as e:
         logger.warning("Falha ao baixar PDF do Anúncio de Encerramento: %s", e)
         return

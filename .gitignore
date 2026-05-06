@@ -14,6 +14,7 @@ env/
 
 # Credenciais — NUNCA commitar
 .streamlit/secrets.toml
+**/.streamlit/secrets.toml
 .env
 *.env
 

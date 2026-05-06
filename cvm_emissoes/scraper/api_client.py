@@ -52,8 +52,8 @@ def _build_session() -> requests.Session:
     """
     session = requests.Session()
     retry = Retry(
-        total=5,
-        backoff_factor=3,
+        total=4,
+        backoff_factor=1,
         status_forcelist=[429, 502, 503, 504],  # 500 tratado manualmente (ver _request)
         allowed_methods=["GET", "POST"],
         raise_on_status=False,  # deixa _request decidir o que fazer com o status
@@ -165,18 +165,26 @@ def _get(url: str, timeout: int = 30) -> Any:
     return _request("GET", url, timeout=timeout)
 
 
-def _get_bytes(url: str, timeout: int = 60) -> bytes:
-    """GET que retorna bytes brutos (para download de PDF)."""
+PDF_MAX_BYTES = 15 * 1024 * 1024  # 15 MB — PDFs maiores são abortados
+
+
+def _get_bytes(url: str, timeout: int = 25) -> bytes:
+    """
+    GET streaming para download de PDF.
+    Aborta se o arquivo ultrapassar PDF_MAX_BYTES, evitando que workers fiquem
+    presos em downloads de 30-40 MB que o servidor da CVM frequentemente reseta.
+    """
     time.sleep(REQUEST_DELAY_SECONDS)
     for tentativa in range(1 + MAX_SESSION_RESETS):
         try:
-            resp = get_session().get(url, timeout=timeout)
+            resp = get_session().get(url, timeout=timeout, stream=True)
         except requests.exceptions.ConnectionError as e:
             raise CVMApiError(f"Falha de conexão ao baixar arquivo. URL: {url}", url=url) from e
         except requests.exceptions.Timeout:
             raise CVMApiError(f"Timeout ao baixar arquivo (>{timeout}s). URL: {url}", url=url) from None
 
         if resp.status_code == 500 and tentativa < MAX_SESSION_RESETS:
+            resp.close()
             reset_session()
             time.sleep(3 * (tentativa + 1))
             continue
@@ -186,7 +194,35 @@ def _get_bytes(url: str, timeout: int = 60) -> bytes:
         except requests.exceptions.HTTPError as e:
             raise CVMApiError(f"Erro HTTP {resp.status_code} ao baixar arquivo. URL: {url}",
                               status_code=resp.status_code, url=url) from e
-        return resp.content
+
+        content_length = resp.headers.get("Content-Length")
+        if content_length and int(content_length) > PDF_MAX_BYTES:
+            resp.close()
+            raise CVMApiError(
+                f"PDF ignorado: {int(content_length) // (1024*1024)} MB excede limite de "
+                f"{PDF_MAX_BYTES // (1024*1024)} MB. URL: {url}",
+                url=url,
+            )
+
+        chunks: list[bytes] = []
+        total = 0
+        try:
+            for chunk in resp.iter_content(chunk_size=65536):
+                total += len(chunk)
+                if total > PDF_MAX_BYTES:
+                    resp.close()
+                    raise CVMApiError(
+                        f"PDF ignorado: ultrapassou {PDF_MAX_BYTES // (1024*1024)} MB durante download. "
+                        f"URL: {url}",
+                        url=url,
+                    )
+                chunks.append(chunk)
+        except CVMApiError:
+            raise
+        except Exception as e:
+            raise CVMApiError(f"Erro ao ler stream do arquivo. URL: {url}", url=url) from e
+
+        return b"".join(chunks)
 
     raise CVMApiError(f"Falha desconhecida ao baixar {url}", url=url)
 

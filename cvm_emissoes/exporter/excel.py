@@ -43,6 +43,13 @@ COLUNAS_EMISSOES = {
     "link_cvm":            "Link CVM",
 }
 
+COLUNAS_FEES = {
+    "fee_flat":               "Fee Flat (Estruturação + Garantia Firme)",
+    "fee_canal_distribuicao": "Fee Canal / Distribuição",
+    "fee_canal_flat":         "Fee Canal Flat",
+    "fee_sucesso":            "Fee de Sucesso",
+}
+
 COLUNAS_ERROS = {
     "id_requerimento":  "ID Requerimento",
     "numero_processo":  "Número do Processo",
@@ -117,9 +124,11 @@ def _ajustar_largura_colunas(ws, colunas: dict, min_w: int = 12, max_w: int = 60
         ws.column_dimensions[col_letter].width = ajustado
 
 
-def _escrever_linha_emissao(ws, row_idx: int, registro: dict):
+def _escrever_linha_emissao(ws, row_idx: int, registro: dict, colunas: dict = None):
     """Escreve uma linha de emissão na aba principal."""
-    for col_idx, chave in enumerate(COLUNAS_EMISSOES.keys(), start=1):
+    if colunas is None:
+        colunas = COLUNAS_EMISSOES
+    for col_idx, chave in enumerate(colunas.keys(), start=1):
         valor_raw = registro.get(chave)
         cell = ws.cell(row=row_idx, column=col_idx)
 
@@ -161,6 +170,7 @@ def exportar_excel(
     registros: list[dict],
     erros: list[dict],
     output_path: Optional[str] = None,
+    incluir_fees: bool = False,
 ) -> str:
     """
     Exporta os registros coletados para um arquivo Excel.
@@ -186,10 +196,14 @@ def exportar_excel(
     ws_emissoes.title = "Emissões"
     ws_emissoes.freeze_panes = "A2"  # congela cabeçalho
 
-    _escrever_header(ws_emissoes, COLUNAS_EMISSOES)
+    colunas_ativas = dict(COLUNAS_EMISSOES)
+    if incluir_fees:
+        colunas_ativas.update(COLUNAS_FEES)
+
+    _escrever_header(ws_emissoes, colunas_ativas)
 
     for row_idx, registro in enumerate(registros, start=2):
-        _escrever_linha_emissao(ws_emissoes, row_idx, registro)
+        _escrever_linha_emissao(ws_emissoes, row_idx, registro, colunas_ativas)
 
     # Altura padrão para linhas de dados
     for row in ws_emissoes.iter_rows(min_row=2):
@@ -198,7 +212,7 @@ def exportar_excel(
     # Altura do cabeçalho
     ws_emissoes.row_dimensions[1].height = 35
 
-    _ajustar_largura_colunas(ws_emissoes, COLUNAS_EMISSOES)
+    _ajustar_largura_colunas(ws_emissoes, colunas_ativas)
 
     # ------------------------------------------------------------------
     # Aba de erros
